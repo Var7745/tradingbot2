@@ -4,18 +4,17 @@ from dotenv import load_dotenv
 
 import pandas as pd
 from binance.client import Client
+from openai import OpenAI
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
-
-from openai import OpenAI
 
 # ================= LOAD ENV =================
 load_dotenv()
@@ -24,7 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError("BOT_TOKEN or OPENAI_API_KEY missing")
+    raise RuntimeError("Missing BOT_TOKEN or OPENAI_API_KEY")
 
 # ================= GLOBALS =================
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -34,14 +33,14 @@ TIMEFRAME = "15m"
 bot_active = False
 user_coins = {}
 
-# ================= INDICATORS (NO pandas-ta) =================
+# ================= INDICATORS =================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
     delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
     rs = avg_gain / avg_loss
@@ -53,7 +52,7 @@ async def ask_ai(prompt: str) -> str:
         response = ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a crypto trading assistant. Use very simple English."},
+                {"role": "system", "content": "Explain crypto trades in simple English."},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -62,11 +61,11 @@ async def ask_ai(prompt: str) -> str:
         return "AI explanation unavailable."
 
 # ================= MARKET DATA =================
-def get_ohlcv(symbol: str, interval="15m", limit=100):
+def get_ohlcv(symbol):
     klines = binance.futures_klines(
         symbol=symbol,
-        interval=interval,
-        limit=limit
+        interval=TIMEFRAME,
+        limit=100
     )
     df = pd.DataFrame(klines, columns=[
         "time","open","high","low","close","volume",
@@ -76,9 +75,9 @@ def get_ohlcv(symbol: str, interval="15m", limit=100):
     return df
 
 # ================= STRATEGY =================
-def generate_signal(coin: str):
+def generate_signal(coin):
     try:
-        df = get_ohlcv(f"{coin}USDT", TIMEFRAME)
+        df = get_ohlcv(f"{coin}USDT")
 
         df["ema20"] = ema(df["close"], 20)
         df["ema50"] = ema(df["close"], 50)
@@ -119,12 +118,11 @@ def generate_signal(coin: str):
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Crypto AI Trading Bot\n\n"
-        "Commands:\n"
-        "/active – start signals\n"
-        "/sleep – stop signals\n"
-        "/add – add coins\n"
-        "signal – get signal"
+        "🤖 Crypto Trading Bot Ready\n\n"
+        "/active – Start signals\n"
+        "/sleep – Stop signals\n"
+        "/add – Add coins\n"
+        "signal – Get signal"
     )
 
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -137,12 +135,12 @@ async def sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_active = False
     await update.message.reply_text("😴 Bot SLEEPING")
 
-# ================= ADD COIN =================
+# ================= ADD COINS =================
 async def add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("BTC", callback_data="add_BTC")],
-        [InlineKeyboardButton("ETH", callback_data="add_ETH")],
-        [InlineKeyboardButton("SOL", callback_data="add_SOL")],
+        [InlineKeyboardButton("BTC", callback_data="BTC")],
+        [InlineKeyboardButton("ETH", callback_data="ETH")],
+        [InlineKeyboardButton("SOL", callback_data="SOL")]
     ]
     await update.message.reply_text(
         "Select coins:",
@@ -153,20 +151,20 @@ async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    coin = query.data.replace("add_", "")
     chat_id = query.message.chat_id
+    coin = query.data
 
     user_coins.setdefault(chat_id, set()).add(coin)
     await query.edit_message_text(f"✅ Added {coin}")
 
 # ================= MESSAGE HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower()
     chat_id = update.message.chat_id
+    text = update.message.text.lower()
 
     if "signal" in text:
         if not bot_active:
-            await update.message.reply_text("⚠️ Bot is sleeping. Send /active.")
+            await update.message.reply_text("⚠️ Bot sleeping. Send /active")
             return
 
         coins = user_coins.get(chat_id, {"BTC"})
@@ -177,15 +175,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             explanation = await ask_ai(
-                f"""
-                Coin: {coin}
-                Direction: {signal['direction']}
-                RSI: {signal['rsi']}
-                Entry: {signal['entry']}
-                Stop Loss: {signal['sl']}
-                Take Profit: {signal['tp']}
-                Explain simply why this trade is valid.
-                """
+                f"Explain {signal['direction']} trade for {coin} with RSI {signal['rsi']}."
             )
 
             await update.message.reply_text(
@@ -202,7 +192,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📊 Confidence: {signal['confidence']}%
 📈 RSI: {signal['rsi']}
 
-🤖 AI Insight:
+🤖 AI:
 {explanation}
 
 ⚠️ Not financial advice
@@ -224,13 +214,13 @@ async def periodic_signals(app):
 
                 await app.bot.send_message(
                     chat_id=chat_id,
-                    text=f"⏰ Auto Signal {coin}\n{signal['direction']} @ {signal['entry']}"
+                    text=f"⏰ Auto Signal {coin}: {signal['direction']} @ {signal['entry']}"
                 )
 
         await asyncio.sleep(900)
 
-# ================= MAIN =================
-async def main():
+# ================= MAIN (NO ASYNCIO.RUN) =================
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -240,11 +230,11 @@ async def main():
     app.add_handler(CallbackQueryHandler(coin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    asyncio.create_task(periodic_signals(app))
+    app.create_task(periodic_signals(app))
 
     print("🤖 Crypto AI Bot running on Render...")
-    await app.run_polling()
+    app.run_polling()
 
 # ================= RUN =================
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
