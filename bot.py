@@ -1,5 +1,7 @@
 import os
 import asyncio
+import threading
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from dotenv import load_dotenv
 
 import pandas as pd
@@ -16,6 +18,14 @@ from telegram.ext import (
     filters,
 )
 
+# ================= RENDER PORT FIX (IMPORTANT) =================
+# This removes: "No open ports detected" warning
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler).serve_forever()
+
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
 # ================= LOAD ENV =================
 load_dotenv()
 
@@ -29,9 +39,14 @@ if not BOT_TOKEN or not OPENAI_API_KEY:
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 binance = Client()
 
-TIMEFRAME = "15m"
 bot_active = False
 user_coins = {}
+
+trade_stats = {
+    "total": 0,
+    "wins": 0,
+    "losses": 0
+}
 
 # ================= INDICATORS =================
 def ema(series, period):
@@ -46,25 +61,11 @@ def rsi(series, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ================= AI =================
-async def ask_ai(prompt: str) -> str:
-    try:
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Explain crypto trades in simple English."},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return "AI explanation unavailable."
-
 # ================= MARKET DATA =================
-def get_ohlcv(symbol):
+def get_ohlcv(symbol, interval):
     klines = binance.futures_klines(
         symbol=symbol,
-        interval=TIMEFRAME,
+        interval=interval,
         limit=100
     )
     df = pd.DataFrame(klines, columns=[
@@ -74,31 +75,36 @@ def get_ohlcv(symbol):
     df["close"] = df["close"].astype(float)
     return df
 
-# ================= STRATEGY =================
+# ================= STRATEGY (FEATURE 2) =================
 def generate_signal(coin):
     try:
-        df = get_ohlcv(f"{coin}USDT")
+        df_15m = get_ohlcv(f"{coin}USDT", "15m")
+        df_1h = get_ohlcv(f"{coin}USDT", "1h")
 
-        df["ema20"] = ema(df["close"], 20)
-        df["ema50"] = ema(df["close"], 50)
-        df["rsi"] = rsi(df["close"], 14)
+        for df in (df_15m, df_1h):
+            df["ema20"] = ema(df["close"], 20)
+            df["ema50"] = ema(df["close"], 50)
+            df["rsi"] = rsi(df["close"], 14)
 
-        last = df.iloc[-1]
-        entry = round(last["close"], 2)
+        l15 = df_15m.iloc[-1]
+        l1h = df_1h.iloc[-1]
 
-        if last["ema20"] > last["ema50"] and last["rsi"] > 55:
+        entry = round(l15["close"], 2)
+
+        if l15["ema20"] > l15["ema50"] and l1h["ema20"] > l1h["ema50"] and l15["rsi"] > 55:
             direction = "LONG"
             sl = round(entry * 0.99, 2)
             tp = round(entry * 1.02, 2)
 
-        elif last["ema20"] < last["ema50"] and last["rsi"] < 45:
+        elif l15["ema20"] < l15["ema50"] and l1h["ema20"] < l1h["ema50"] and l15["rsi"] < 45:
             direction = "SHORT"
             sl = round(entry * 1.01, 2)
             tp = round(entry * 0.98, 2)
+
         else:
             return None
 
-        confidence = min(90, max(65, int(abs(last["rsi"] - 50) * 2)))
+        trade_stats["total"] += 1
 
         return {
             "coin": coin,
@@ -106,13 +112,36 @@ def generate_signal(coin):
             "entry": entry,
             "sl": sl,
             "tp": tp,
-            "confidence": confidence,
-            "rsi": round(last["rsi"], 2)
+            "rsi": round(l15["rsi"], 2),
         }
 
     except Exception as e:
         print("Signal error:", e)
         return None
+
+# ================= AI (FEATURE 5) =================
+async def ask_ai(signal):
+    prompt = f"""
+Coin: {signal['coin']}
+Direction: {signal['direction']}
+RSI: {signal['rsi']}
+Entry: {signal['entry']}
+Stop Loss: {signal['sl']}
+Take Profit: {signal['tp']}
+
+Explain briefly why this trade is valid.
+"""
+    try:
+        res = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Be short and clear."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return res.choices[0].message.content.strip()
+    except:
+        return "AI explanation unavailable."
 
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -121,6 +150,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/active – Start signals\n"
         "/sleep – Stop signals\n"
         "/add – Add coins\n"
+        "/stats – Bot stats\n"
         "signal – Get signal"
     )
 
@@ -134,12 +164,27 @@ async def sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_active = False
     await update.message.reply_text("😴 Bot SLEEPING")
 
+# ================= STATS (FEATURE 4) =================
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = trade_stats["total"]
+    wins = trade_stats["wins"]
+    losses = trade_stats["losses"]
+    accuracy = (wins / total * 100) if total else 0
+
+    await update.message.reply_text(
+        f"📊 BOT STATS\n\n"
+        f"Total Trades: {total}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Accuracy: {accuracy:.2f}%"
+    )
+
 # ================= ADD COINS =================
 async def add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("BTC", callback_data="BTC")],
         [InlineKeyboardButton("ETH", callback_data="ETH")],
-        [InlineKeyboardButton("SOL", callback_data="SOL")],
+        [InlineKeyboardButton("SOL", callback_data="SOL")]
     ]
     await update.message.reply_text(
         "Select coins:",
@@ -149,56 +194,37 @@ async def add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    chat_id = query.message.chat_id
-    coin = query.data
-    user_coins.setdefault(chat_id, set()).add(coin)
-
-    await query.edit_message_text(f"✅ Added {coin}")
+    user_coins.setdefault(query.message.chat_id, set()).add(query.data)
+    await query.edit_message_text(f"✅ Added {query.data}")
 
 # ================= MESSAGE HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    text = update.message.text.lower()
 
-    if "signal" in text:
+    if "signal" in update.message.text.lower():
         if not bot_active:
-            await update.message.reply_text("⚠️ Bot sleeping. Send /active.")
+            await update.message.reply_text("⚠️ Bot sleeping. Use /active.")
             return
 
         coins = user_coins.get(chat_id, {"BTC"})
-
         for coin in coins:
             signal = generate_signal(coin)
             if not signal:
                 continue
 
-            explanation = await ask_ai(
-                f"Explain {signal['direction']} trade for {coin} with RSI {signal['rsi']}."
-            )
+            explanation = await ask_ai(signal)
 
             await update.message.reply_text(
-                f"""
-🚨 {coin} FUTURES SIGNAL 🚨
-
-📌 Direction: {signal['direction']}
-⏱ Timeframe: {TIMEFRAME}
-
-💰 Entry: {signal['entry']}
-🛑 Stop Loss: {signal['sl']}
-🎯 Take Profit: {signal['tp']}
-
-📊 Confidence: {signal['confidence']}%
-📈 RSI: {signal['rsi']}
-
-🤖 AI:
-{explanation}
-
-⚠️ Not financial advice
-"""
+                f"🚨 {coin} SIGNAL 🚨\n\n"
+                f"Direction: {signal['direction']}\n"
+                f"Entry: {signal['entry']}\n"
+                f"SL: {signal['sl']}\n"
+                f"TP: {signal['tp']}\n"
+                f"RSI: {signal['rsi']}\n\n"
+                f"🤖 {explanation}"
             )
 
-# ================= BACKGROUND TASK =================
+# ================= BACKGROUND TASK (CORRECT WAY) =================
 async def periodic_signals(app):
     while True:
         if bot_active:
@@ -208,11 +234,10 @@ async def periodic_signals(app):
                     if signal:
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text=f"⏰ Auto Signal {coin}: {signal['direction']} @ {signal['entry']}"
+                            text=f"⏰ Auto {coin}: {signal['direction']} @ {signal['entry']}"
                         )
         await asyncio.sleep(900)
 
-# ================= POST INIT (IMPORTANT) =================
 async def post_init(app):
     app.create_task(periodic_signals(app))
 
@@ -229,10 +254,11 @@ def main():
     app.add_handler(CommandHandler("active", activate))
     app.add_handler(CommandHandler("sleep", sleep))
     app.add_handler(CommandHandler("add", add_coin))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(coin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 Crypto AI Bot running on Render...")
+    print("🤖 Crypto AI Bot running cleanly on Render...")
     app.run_polling()
 
 # ================= RUN =================
