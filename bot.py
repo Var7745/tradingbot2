@@ -1,5 +1,4 @@
 import os
-import asyncio
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from dotenv import load_dotenv
@@ -7,11 +6,7 @@ from dotenv import load_dotenv
 import pandas as pd
 from binance.client import Client
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -38,6 +33,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 binance = Client()
 bot_active = False
 
+# store coin selections per user
+selected_coins = {}
+
 # ================= INDICATORS =================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -57,6 +55,9 @@ def get_ohlcv(symbol, interval):
     ])
     df["c"] = df["c"].astype(float)
     return df
+
+def get_price(symbol):
+    return float(binance.futures_mark_price(symbol=symbol)["markPrice"])
 
 # ================= STRATEGY =================
 def generate_signal(coin):
@@ -85,7 +86,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Crypto Signal Bot\n\n"
         "/active – enable signals\n"
         "/sleep – disable signals\n"
-        "signal – select coins\n"
+        "/status – bot status\n"
+        "/price BTC – current price\n"
+        "signal – select coins"
     )
 
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,49 +101,89 @@ async def sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_active = False
     await update.message.reply_text("😴 Bot SLEEPING")
 
-# ================= SIGNAL COIN SELECTION =================
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    coins = ", ".join(selected_coins.get(update.message.chat_id, [])) or "None"
+    await update.message.reply_text(
+        f"📊 STATUS\nActive: {bot_active}\nSelected coins: {coins}"
+    )
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /price BTC ETH")
+        return
+
+    for c in context.args:
+        p = get_price(c.upper() + "USDT")
+        await update.message.reply_text(f"{c.upper()}: {round(p,2)}")
+
+# ================= SIGNAL SELECTION =================
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot_active:
         await update.message.reply_text("⚠️ Bot sleeping. Use /active")
         return
 
+    chat_id = update.message.chat_id
+    selected_coins[chat_id] = []
+
     coins = [
         ["BTC", "ETH", "SOL"],
         ["BNB", "XRP", "ADA"],
-        ["DOGE", "AVAX", "MATIC"]
+        ["DOGE", "AVAX", "MATIC"],
+        ["DONE"]
     ]
 
-    keyboard = [
-        [InlineKeyboardButton(c, callback_data=f"signal_{c}") for c in row]
-        for row in coins
-    ]
+    keyboard = []
+    for row in coins:
+        buttons = []
+        for c in row:
+            if c == "DONE":
+                buttons.append(InlineKeyboardButton("✅ DONE", callback_data="done"))
+            else:
+                buttons.append(InlineKeyboardButton(c, callback_data=f"pick_{c}"))
+        keyboard.append(buttons)
 
     await update.message.reply_text(
-        "Select coin to get signal:",
+        "Select coins (tap multiple, then DONE):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# ================= CALLBACK HANDLER =================
-async def coin_signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= CALLBACK =================
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    coin = query.data.replace("signal_", "")
-    signal = generate_signal(coin)
+    chat_id = query.message.chat_id
+    data = query.data
 
-    if not signal:
-        await query.message.reply_text(f"❌ {coin}: No trade setup")
+    if data.startswith("pick_"):
+        coin = data.replace("pick_", "")
+        selected_coins.setdefault(chat_id, [])
+        if coin not in selected_coins[chat_id]:
+            selected_coins[chat_id].append(coin)
+
+        await query.message.reply_text(f"➕ Added {coin}")
         return
 
-    side, entry, sl, tp = signal
+    if data == "done":
+        coins = selected_coins.get(chat_id, [])
+        if not coins:
+            await query.message.reply_text("❌ No coins selected")
+            return
 
-    await query.message.reply_text(
-        f"🚨 {coin} SIGNAL\n\n"
-        f"Direction: {side}\n"
-        f"Entry: {round(entry,2)}\n"
-        f"SL: {round(sl,2)}\n"
-        f"TP: {round(tp,2)}"
-    )
+        for coin in coins:
+            signal = generate_signal(coin)
+            if not signal:
+                await query.message.reply_text(f"❌ {coin}: No setup")
+                continue
+
+            side, entry, sl, tp = signal
+            await query.message.reply_text(
+                f"🚨 {coin} SIGNAL\n\n"
+                f"Direction: {side}\n"
+                f"Entry: {round(entry,2)}\n"
+                f"SL: {round(sl,2)}\n"
+                f"TP: {round(tp,2)}"
+            )
 
 # ================= MAIN =================
 def main():
@@ -149,8 +192,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("active", activate))
     app.add_handler(CommandHandler("sleep", sleep))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("price", price_cmd))
     app.add_handler(CommandHandler("signal", signal_command))
-    app.add_handler(CallbackQueryHandler(coin_signal_callback))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
 
     app.run_polling()
