@@ -57,7 +57,7 @@ async def ask_ai(prompt: str) -> str:
             ],
         )
         return response.choices[0].message.content.strip()
-    except:
+    except Exception:
         return "AI explanation unavailable."
 
 # ================= MARKET DATA =================
@@ -95,7 +95,6 @@ def generate_signal(coin):
             direction = "SHORT"
             sl = round(entry * 1.01, 2)
             tp = round(entry * 0.98, 2)
-
         else:
             return None
 
@@ -140,7 +139,7 @@ async def add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("BTC", callback_data="BTC")],
         [InlineKeyboardButton("ETH", callback_data="ETH")],
-        [InlineKeyboardButton("SOL", callback_data="SOL")]
+        [InlineKeyboardButton("SOL", callback_data="SOL")],
     ]
     await update.message.reply_text(
         "Select coins:",
@@ -153,8 +152,8 @@ async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = query.message.chat_id
     coin = query.data
-
     user_coins.setdefault(chat_id, set()).add(coin)
+
     await query.edit_message_text(f"✅ Added {coin}")
 
 # ================= MESSAGE HANDLER =================
@@ -164,7 +163,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "signal" in text:
         if not bot_active:
-            await update.message.reply_text("⚠️ Bot sleeping. Send /active")
+            await update.message.reply_text("⚠️ Bot sleeping. Send /active.")
             return
 
         coins = user_coins.get(chat_id, {"BTC"})
@@ -199,29 +198,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
             )
 
-# ================= PERIODIC SIGNALS =================
+# ================= BACKGROUND TASK =================
 async def periodic_signals(app):
     while True:
-        if not bot_active:
-            await asyncio.sleep(60)
-            continue
-
-        for chat_id, coins in user_coins.items():
-            for coin in coins:
-                signal = generate_signal(coin)
-                if not signal:
-                    continue
-
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⏰ Auto Signal {coin}: {signal['direction']} @ {signal['entry']}"
-                )
-
+        if bot_active:
+            for chat_id, coins in user_coins.items():
+                for coin in coins:
+                    signal = generate_signal(coin)
+                    if signal:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⏰ Auto Signal {coin}: {signal['direction']} @ {signal['entry']}"
+                        )
         await asyncio.sleep(900)
 
-# ================= MAIN (NO ASYNCIO.RUN) =================
+# ================= POST INIT (IMPORTANT) =================
+async def post_init(app):
+    app.create_task(periodic_signals(app))
+
+# ================= MAIN =================
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("active", activate))
@@ -229,8 +231,6 @@ def main():
     app.add_handler(CommandHandler("add", add_coin))
     app.add_handler(CallbackQueryHandler(coin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    app.create_task(periodic_signals(app))
 
     print("🤖 Crypto AI Bot running on Render...")
     app.run_polling()
