@@ -1,10 +1,8 @@
 import os
 import asyncio
-import aiohttp
 from dotenv import load_dotenv
 
 import pandas as pd
-import pandas_ta as ta
 from binance.client import Client
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,25 +27,38 @@ if not BOT_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError("BOT_TOKEN or OPENAI_API_KEY missing")
 
 # ================= GLOBALS =================
-client_ai = OpenAI(api_key=OPENAI_API_KEY)
+ai_client = OpenAI(api_key=OPENAI_API_KEY)
 binance = Client()
 
 TIMEFRAME = "15m"
 bot_active = False
 user_coins = {}
 
+# ================= INDICATORS (NO pandas-ta) =================
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 # ================= AI =================
 async def ask_ai(prompt: str) -> str:
     try:
-        response = client_ai.chat.completions.create(
+        response = ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a crypto trading assistant. Use simple English."},
+                {"role": "system", "content": "You are a crypto trading assistant. Use very simple English."},
                 {"role": "user", "content": prompt},
             ],
         )
         return response.choices[0].message.content.strip()
-    except Exception as e:
+    except:
         return "AI explanation unavailable."
 
 # ================= MARKET DATA =================
@@ -69,9 +80,9 @@ def generate_signal(coin: str):
     try:
         df = get_ohlcv(f"{coin}USDT", TIMEFRAME)
 
-        df["ema20"] = ta.ema(df["close"], 20)
-        df["ema50"] = ta.ema(df["close"], 50)
-        df["rsi"] = ta.rsi(df["close"], 14)
+        df["ema20"] = ema(df["close"], 20)
+        df["ema50"] = ema(df["close"], 50)
+        df["rsi"] = rsi(df["close"], 14)
 
         last = df.iloc[-1]
         entry = round(last["close"], 2)
@@ -108,12 +119,12 @@ def generate_signal(coin: str):
 # ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Crypto AI Bot Ready\n\n"
+        "👋 Crypto AI Trading Bot\n\n"
         "Commands:\n"
         "/active – start signals\n"
         "/sleep – stop signals\n"
         "/add – add coins\n"
-        "signal – get signal\n"
+        "signal – get signal"
     )
 
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -150,8 +161,6 @@ async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= MESSAGE HANDLER =================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_active
-
     text = update.message.text.lower()
     chat_id = update.message.chat_id
 
